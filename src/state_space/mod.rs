@@ -8,9 +8,8 @@ use crate::amms::amm::AMM;
 use crate::amms::error::AMMError;
 use crate::amms::factory::Factory;
 
-use alloy::consensus::BlockHeader;
 use alloy::eips::BlockId;
-use alloy::rpc::types::{Block, Filter, FilterSet, Log};
+use alloy::rpc::types::{Block, Filter, FilterSet, Header, Log};
 use alloy::{
     network::Network,
     primitives::{Address, FixedBytes},
@@ -28,8 +27,6 @@ use futures::Stream;
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::debug;
@@ -40,7 +37,6 @@ pub const CACHE_SIZE: usize = 30;
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
     pub state: Arc<RwLock<StateSpace>>,
-    pub latest_block: Arc<AtomicU64>,
     // discovery_manager: Option<DiscoveryManager>,
     pub block_filter: Filter,
     pub provider: P,
@@ -57,10 +53,9 @@ impl<N, P> StateSpaceManager<N, P> {
     >
     where
         P: Provider<N> + Clone + 'static,
-        N: Network<BlockResponse = Block>,
+        N: Network<HeaderResponse = Header, BlockResponse = Block>,
     {
         let provider = self.provider.clone();
-        let latest_block = self.latest_block.clone();
         let state = self.state.clone();
         let mut block_filter = self.block_filter.clone();
 
@@ -70,14 +65,11 @@ impl<N, P> StateSpaceManager<N, P> {
             tokio::pin!(block_stream);
 
             while let Some(block) = block_stream.next().await {
-                let block_number = block.number();
-                block_filter = block_filter.select(block_number);
-
+                block_filter = block_filter.select(block.number);
 
                 let logs = provider.get_logs(&block_filter).await?;
 
-                let affected_amms = state.write().await.sync(&logs)?;
-                latest_block.store(block_number, Ordering::Relaxed);
+                let affected_amms = state.write().await.sync(&logs, &block)?;
 
                 yield Ok(affected_amms);
             }
@@ -89,7 +81,6 @@ impl<N, P> StateSpaceManager<N, P> {
 #[derive(Debug, Default)]
 pub struct StateSpaceBuilder<N, P> {
     pub provider: P,
-    pub latest_block: u64,
     pub factories: Vec<Factory>,
     pub amms: Vec<AMM>,
     pub filters: Vec<PoolFilter>,
@@ -105,19 +96,11 @@ where
     pub fn new(provider: P) -> StateSpaceBuilder<N, P> {
         Self {
             provider,
-            latest_block: 0,
             factories: vec![],
             amms: vec![],
             filters: vec![],
             // discovery: false,
             phantom: PhantomData,
-        }
-    }
-
-    pub fn block(self, latest_block: u64) -> StateSpaceBuilder<N, P> {
-        StateSpaceBuilder {
-            latest_block,
-            ..self
         }
     }
 
@@ -233,7 +216,6 @@ where
         }
 
         Ok(StateSpaceManager {
-            latest_block: Arc::new(AtomicU64::new(self.latest_block)),
             state: Arc::new(RwLock::new(state_space)),
             block_filter,
             provider: self.provider,
@@ -245,7 +227,8 @@ where
 #[derive(Debug, Default)]
 pub struct StateSpace {
     pub state: HashMap<Address, AMM>,
-    pub latest_block: Arc<AtomicU64>,
+    /// Header of the *last* block that has been fully applied.
+    pub block: Option<Header>,
     cache: StateChangeCache<CACHE_SIZE>,
 }
 
@@ -258,58 +241,32 @@ impl StateSpace {
         self.state.get_mut(address)
     }
 
-    pub fn sync(&mut self, logs: &[Log]) -> Result<Vec<Address>, StateSpaceError> {
-        let latest = self.latest_block.load(Ordering::Relaxed);
-        let Some(mut block_number) = logs
-            .first()
-            .map(|log| log.block_number.ok_or(StateSpaceError::MissingBlockNumber))
-            .transpose()?
-        else {
-            return Ok(vec![]);
-        };
-
+    /// Applies all logs that belong to `block`.
+    pub fn sync(&mut self, logs: &[Log], block: &Header) -> Result<Vec<Address>, StateSpaceError> {
         // Check if there is a reorg and unwind to state before block_number
-        if latest >= block_number {
-            info!(
-                target: "state_space::sync",
-                from = %latest,
-                to = %block_number - 1,
-                "Unwinding state changes"
-            );
+        if let Some(prev) = &self.block {
+            if prev.number >= block.number {
+                info!(
+                    target: "state_space::sync",
+                    from = %prev.number,
+                    to = %block.number-1,
+                    "Unwinding state changes"
+                );
 
-            let cached_state = self.cache.unwind_state_changes(block_number);
-            for amm in cached_state {
-                debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
-                self.state.insert(amm.address(), amm);
+                let cached_state = self.cache.unwind_state_changes(block.number);
+                for amm in cached_state {
+                    debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
+                    self.state.insert(amm.address(), amm);
+                }
             }
         }
 
-        let mut cached_amms = HashSet::new();
         let mut affected_amms = HashSet::new();
         for log in logs {
-            // If the block number is updated, cache the current block state changes
-            let log_block_number = log
-                .block_number
-                .ok_or(StateSpaceError::MissingBlockNumber)?;
-            if log_block_number != block_number {
-                let amms = cached_amms.drain().collect::<Vec<AMM>>();
-                affected_amms.extend(amms.iter().map(|amm| amm.address()));
-                let state_change = StateChange::new(amms, block_number);
-
-                debug!(
-                    target: "state_space::sync",
-                    state_change = ?state_change,
-                    "Caching state change"
-                );
-
-                self.cache.push(state_change);
-                block_number = log_block_number;
-            }
-
             // If the AMM is in the state space add the current state to cache and sync from log
             let address = log.address();
             if let Some(amm) = self.state.get_mut(&address) {
-                cached_amms.insert(amm.clone());
+                affected_amms.insert(amm.clone());
                 amm.sync(log)?;
 
                 info!(
@@ -320,21 +277,22 @@ impl StateSpace {
             }
         }
 
-        if !cached_amms.is_empty() {
-            let amms = cached_amms.drain().collect::<Vec<AMM>>();
-            affected_amms.extend(amms.iter().map(|amm| amm.address()));
-            let state_change = StateChange::new(amms, block_number);
-
-            debug!(
+        let affected_addressed = affected_amms
+            .iter()
+            .map(|amm| amm.address())
+            .collect::<Vec<_>>();
+        let state_change = StateChange::new(affected_amms.into_iter().collect(), block.number);
+        debug!(
                 target: "state_space::sync",
                 state_change = ?state_change,
                 "Caching state change"
-            );
+        );
+        self.cache.push(state_change);
 
-            self.cache.push(state_change);
-        }
+        // Persist the header
+        self.block = Some(block.clone());
 
-        Ok(affected_amms.into_iter().collect())
+        Ok(affected_addressed)
     }
 }
 
