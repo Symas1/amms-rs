@@ -9,6 +9,8 @@ use thiserror::Error;
 pub enum AMMError {
     #[error(transparent)]
     TransportError(#[from] alloy::transports::RpcError<TransportErrorKind>),
+    #[error("Block Header not found")]
+    MissingBlockHeader,
     #[error(transparent)]
     ContractError(#[from] alloy::contract::Error),
     #[error(transparent)]

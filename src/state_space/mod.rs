@@ -90,7 +90,7 @@ pub struct StateSpaceBuilder<N, P> {
 
 impl<N, P> StateSpaceBuilder<N, P>
 where
-    N: Network,
+    N: Network<HeaderResponse = Header, BlockResponse = Block>,
     P: Provider<N> + Clone + 'static,
 {
     pub fn new(provider: P) -> StateSpaceBuilder<N, P> {
@@ -117,7 +117,15 @@ where
     }
 
     pub async fn sync(self) -> Result<StateSpaceManager<N, P>, AMMError> {
-        let chain_tip = BlockId::from(self.provider.get_block_number().await?);
+        let block = self
+            .provider
+            .get_block(BlockId::latest())
+            .await
+            .map_err(|e| AMMError::TransportError(e))?
+            .ok_or_else(|| AMMError::MissingBlockHeader)?
+            .header;
+
+        let chain_tip = BlockId::from(block.number);
         let factories = self.factories.clone();
         let mut futures = FuturesUnordered::new();
 
@@ -197,7 +205,7 @@ where
             }));
         }
 
-        let mut state_space = StateSpace::default();
+        let mut state_space = StateSpace::new(block);
         while let Some(res) = futures.next().await {
             let synced_amms = res??;
 
@@ -228,11 +236,20 @@ where
 pub struct StateSpace {
     pub state: HashMap<Address, AMM>,
     /// Header of the *last* block that has been fully applied.
-    pub block: Option<Header>,
+    pub block: Header,
     cache: StateChangeCache<CACHE_SIZE>,
 }
 
 impl StateSpace {
+    /// Create a fresh state space at `block`.
+    pub fn new(block: Header) -> Self {
+        Self {
+            state: HashMap::new(),
+            block,
+            cache: StateChangeCache::default(),
+        }
+    }
+
     pub fn get(&self, address: &Address) -> Option<&AMM> {
         self.state.get(address)
     }
@@ -244,20 +261,18 @@ impl StateSpace {
     /// Applies all logs that belong to `block`.
     pub fn sync(&mut self, logs: &[Log], block: &Header) -> Result<Vec<Address>, StateSpaceError> {
         // Check if there is a reorg and unwind to state before block_number
-        if let Some(prev) = &self.block {
-            if prev.number >= block.number {
-                info!(
-                    target: "state_space::sync",
-                    from = %prev.number,
-                    to = %block.number-1,
-                    "Unwinding state changes"
-                );
+        if self.block.number >= block.number {
+            info!(
+                target: "state_space::sync",
+                from = %self.block.number,
+                to = %block.number-1,
+                "Unwinding state changes"
+            );
 
-                let cached_state = self.cache.unwind_state_changes(block.number);
-                for amm in cached_state {
-                    debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
-                    self.state.insert(amm.address(), amm);
-                }
+            let cached_state = self.cache.unwind_state_changes(block.number);
+            for amm in cached_state {
+                debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
+                self.state.insert(amm.address(), amm);
             }
         }
 
@@ -290,7 +305,7 @@ impl StateSpace {
         self.cache.push(state_change);
 
         // Persist the header
-        self.block = Some(block.clone());
+        self.block = block.clone();
 
         Ok(affected_addressed)
     }
