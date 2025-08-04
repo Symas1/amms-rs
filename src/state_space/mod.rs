@@ -53,7 +53,7 @@ impl<N, P> StateSpaceManager<N, P> {
     >
     where
         P: Provider<N> + Clone + 'static,
-        N: Network<HeaderResponse = Header, BlockResponse = Block>,
+        N: Network<HeaderResponse = Header>,
     {
         let provider = self.provider.clone();
         let state = self.state.clone();
