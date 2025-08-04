@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
 
-pub const CACHE_SIZE: usize = 30;
+pub const CACHE_SIZE: usize = 250;
 
 #[derive(Clone)]
 pub struct StateSpaceManager<N, P> {
