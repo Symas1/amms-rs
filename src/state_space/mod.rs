@@ -16,8 +16,6 @@ use alloy::{
     providers::Provider,
 };
 use async_stream::stream;
-use cache::StateChange;
-use cache::StateChangeCache;
 
 use error::StateSpaceError;
 use filters::AMMFilter;
@@ -29,7 +27,6 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 use tokio::sync::RwLock;
-use tracing::debug;
 use tracing::info;
 
 pub const CACHE_SIZE: usize = 250;
@@ -57,19 +54,37 @@ impl<N, P> StateSpaceManager<N, P> {
     {
         let provider = self.provider.clone();
         let state = self.state.clone();
-        let mut block_filter = self.block_filter.clone();
+        let base_filter = self.block_filter.clone();
 
         let block_stream = provider.subscribe_blocks().await?.into_stream();
 
         Ok(Box::pin(stream! {
             tokio::pin!(block_stream);
 
-            while let Some(block) = block_stream.next().await {
-                block_filter = block_filter.select(block.number);
+            while let Some(new_block) = block_stream.next().await {
+                let prev_block = state.read().await.block.clone();
 
-                let logs = provider.get_logs(&block_filter).await?;
+                if prev_block.hash == new_block.hash {
+                    // 1. Handle no-op for duplicate blocks
+                    continue;
+                }
 
-                let affected_amms = state.write().await.sync(&logs, &block)?;
+                // 2. Handle fatal reorg error before any network calls
+                if new_block.number <= prev_block.number {
+                    yield Err(StateSpaceError::ReorgNotSupported {
+                        current_block: prev_block.number,
+                        new_block: new_block.number,
+                    });
+                    break; // Terminate the stream
+                }
+
+                let filter = base_filter
+                    .clone()
+                    .from_block(prev_block.number + 1)
+                    .to_block(new_block.number);
+                let logs = provider.get_logs(&filter).await?;
+
+                let affected_amms = state.write().await.sync(&logs, &new_block)?;
 
                 yield Ok(affected_amms);
             }
@@ -237,7 +252,6 @@ pub struct StateSpace {
     pub state: HashMap<Address, AMM>,
     /// Header of the *last* block that has been fully applied.
     pub block: Header,
-    cache: StateChangeCache<CACHE_SIZE>,
 }
 
 impl StateSpace {
@@ -246,7 +260,6 @@ impl StateSpace {
         Self {
             state: HashMap::new(),
             block,
-            cache: StateChangeCache::default(),
         }
     }
 
@@ -258,56 +271,39 @@ impl StateSpace {
         self.state.get_mut(address)
     }
 
-    /// Applies all logs that belong to `block`.
-    pub fn sync(&mut self, logs: &[Log], block: &Header) -> Result<Vec<Address>, StateSpaceError> {
-        // Check if there is a reorg and unwind to state before block_number
-        if self.block.number >= block.number {
-            info!(
-                target: "state_space::sync",
-                from = %self.block.number,
-                to = %block.number-1,
-                "Unwinding state changes"
-            );
-
-            let cached_state = self.cache.unwind_state_changes(block.number);
-            for amm in cached_state {
-                debug!(target: "state_space::sync", ?amm, "Reverting AMM state");
-                self.state.insert(amm.address(), amm);
+    /// Applies all logs up to and including `tip_block`, returning the set of affected AMM addresses.
+    pub fn sync(
+        &mut self,
+        logs: &[Log],
+        tip_block: &Header,
+    ) -> Result<Vec<Address>, StateSpaceError> {
+        // 1. Check for reorgs or stale blocks. Fail immediately if detected.
+        if tip_block.number <= self.block.number {
+            // Allow reprocessing the exact same block hash, but nothing else.
+            if tip_block.hash != self.block.hash {
+                return Err(StateSpaceError::ReorgNotSupported {
+                    current_block: self.block.number,
+                    new_block: tip_block.number,
+                });
+            } else {
+                // No-op: same block as before.
+                return Ok(vec![]);
             }
         }
 
-        let mut affected_amms = HashSet::new();
+        // 2. Apply logs. No caching logic needed.
+        let mut affected_addresses = HashSet::new();
         for log in logs {
-            // If the AMM is in the state space add the current state to cache and sync from log
-            let address = log.address();
-            if let Some(amm) = self.state.get_mut(&address) {
-                affected_amms.insert(amm.clone());
+            if let Some(amm) = self.state.get_mut(&log.address()) {
+                affected_addresses.insert(amm.address());
                 amm.sync(log)?;
-
-                info!(
-                    target: "state_space::sync",
-                    ?amm,
-                    "Synced AMM"
-                );
             }
         }
 
-        let affected_addressed = affected_amms
-            .iter()
-            .map(|amm| amm.address())
-            .collect::<Vec<_>>();
-        let state_change = StateChange::new(affected_amms.into_iter().collect(), block.number);
-        debug!(
-                target: "state_space::sync",
-                state_change = ?state_change,
-                "Caching state change"
-        );
-        self.cache.push(state_change);
+        // 3. Update the block header to the new tip.
+        self.block = tip_block.clone();
 
-        // Persist the header
-        self.block = block.clone();
-
-        Ok(affected_addressed)
+        Ok(affected_addresses.into_iter().collect())
     }
 }
 

@@ -13,4 +13,8 @@ pub enum StateSpaceError {
     JoinError(#[from] tokio::task::JoinError),
     #[error("Block Number Does not Exist")]
     MissingBlockNumber,
+    #[error(
+        "Reorg detected from block {current_block} to {new_block}. Reorgs are not supported in V1."
+    )]
+    ReorgNotSupported { current_block: u64, new_block: u64 },
 }
