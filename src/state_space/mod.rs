@@ -44,6 +44,7 @@ pub struct StateSpaceManager<N, P> {
 impl<N, P> StateSpaceManager<N, P> {
     pub async fn subscribe(
         &self,
+        chain_http: Option<P>, // optional HTTP provider to use for get_logs
     ) -> Result<
         Pin<Box<dyn Stream<Item = Result<Vec<Address>, StateSpaceError>> + Send>>,
         StateSpaceError,
@@ -52,11 +53,12 @@ impl<N, P> StateSpaceManager<N, P> {
         P: Provider<N> + Clone + 'static,
         N: Network<HeaderResponse = Header>,
     {
-        let provider = self.provider.clone();
+        let ws_provider = self.provider.clone();
+        let http_provider = chain_http.clone();
         let state = self.state.clone();
         let base_filter = self.block_filter.clone();
 
-        let block_stream = provider.subscribe_blocks().await?.into_stream();
+        let block_stream = ws_provider.subscribe_blocks().await?.into_stream();
 
         Ok(Box::pin(stream! {
             tokio::pin!(block_stream);
@@ -82,7 +84,13 @@ impl<N, P> StateSpaceManager<N, P> {
                     .clone()
                     .from_block(prev_block.number + 1)
                     .to_block(new_block.number);
-                let logs = provider.get_logs(&filter).await?;
+
+                // prefer HTTP provider for get_logs when provided, otherwise use WS provider
+                let logs = if let Some(http) = &http_provider {
+                    http.get_logs(&filter).await?
+                } else {
+                    ws_provider.get_logs(&filter).await?
+                };
 
                 let affected_amms = state.write().await.sync(&logs, &new_block)?;
 
